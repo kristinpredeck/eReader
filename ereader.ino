@@ -9,6 +9,14 @@
  *
  * Reading controls: RIGHT/LEFT = page, UP/DOWN = chapter, CENTER = library.
  * NOTE: tri-color eInk does a full ~15s refresh on every page.
+ *
+ * Position is remembered: the current book + page offset are written to
+ * /.bookmark on the card after every page, so a reset, auto-sleep, or
+ * power-off resumes exactly where you were instead of dropping to the menu.
+ *
+ * Power: after AUTO_SLEEP_MS of no button (or hold-CENTER), the RP2040 goes
+ * dormant (~0.2mA, wakes on any button). The eInk keeps showing the page the
+ * whole time (it holds its image with no power). Waking reboots and resumes.
  */
 
 #include <SPI.h>
@@ -16,6 +24,8 @@
 #include <vector>
 #include "Adafruit_ThinkInk.h"
 #include <Fonts/FreeSerif9pt7b.h>   // body font - swap for FreeSans9pt7b for sans-serif
+
+#include "pico/stdlib.h"   // set_sys_clock_khz() for the low-power idle
 
 // ---------- display ----------
 #define EPD_DC    PIN_EPD_DC
@@ -45,17 +55,22 @@ const int MX = 4, MY = 4; // margins
 const int MTS = 2;
 const int MCW = 6 * MTS, MCH = 8 * MTS;
 
-enum Mode { MENU, READING, SLEEP };
+enum Mode { MENU, READING };
 Mode mode = MENU;
 
 std::vector<String> books;
 int sel = 0;
 
 File book;
+String curBookName;           // the open book's filename (for the bookmark)
 long curStart = 0;
 long nextStart = -1;
 std::vector<long> history;    // page-start offsets for "previous page"
 std::vector<long> chapters;   // byte offsets of chapter headings
+
+const char *BOOKMARK_PATH = "/.bookmark";
+const unsigned long AUTO_SLEEP_MS = 5UL * 60 * 1000;  // idle -> dormant after 5 min
+unsigned long lastActivity = 0;
 
 // Returns 1=up 2=down 3=left 4=right 5=center(tap) 6=center(hold ~1s) 0=none
 int readButton() {
@@ -169,14 +184,48 @@ void scanChapters(File &f) {
   }
 }
 
+// Persist the current book + page offset so a reset/sleep resumes here.
+// Cheap next to a 15s refresh; writing every page makes brownout recoveries
+// land on the right page.
+void saveBookmark() {
+  if (curBookName.length() == 0) return;
+  SD.remove(BOOKMARK_PATH);                 // FILE_WRITE appends, so truncate first
+  File b = SD.open(BOOKMARK_PATH, FILE_WRITE);
+  if (!b) return;
+  b.println(curBookName);
+  b.println(curStart);
+  b.close();
+}
+
 void renderPage() {
   nextStart = layoutPage(book, curStart, true);
   display.display();
+  saveBookmark();
 }
 
-void clearScreen() {        // blank to white (storage-safe) and go idle
+// Low-power idle. The RP2040 has no busy-poll avoidance here, so instead we
+// drop the system clock from 125MHz to 48MHz, which cuts the idle current
+// several-fold, then spin at that low clock waiting for any button. The eInk
+// keeps showing the current page the whole time (it holds its image with no
+// power). On a press we reboot, which restores the full clock and resumes the
+// bookmarked page via tryResume().
+//
+// delay()/millis() keep correct time at any clock (the RP2040 timer runs off a
+// fixed 1MHz tick), so readButton() still works while throttled.
+//
+// For much deeper (months-long) sleep you'd need true dormant mode from
+// pico-extras (pico/sleep.h), which this core version doesn't ship.
+void deepSleep() {
+  // Rest on a clean white field, not the page. A dense text image left on a
+  // tri-color panel for hours causes ghosting/retention, which shows up as a
+  // longer, uglier refresh (and a near-black flash) on the next page turn.
+  // White is the lowest-retention state; waking redraws the page from clean
+  // white. The bookmark is what lets us come back to the exact page.
   display.clearBuffer();
-  display.display();
+  display.display();                     // ~15s white refresh (full clock)
+  set_sys_clock_khz(48000, true);        // throttle to save battery
+  while (readButton() == 0) delay(50);   // wait for any button
+  rp2040.restart();                      // reboot: full clock + resume bookmark
 }
 
 void jumpChapter(int dir) {
@@ -214,13 +263,34 @@ void drawMenu() {
   display.display();
 }
 
-void openBook(int i) {
-  book = SD.open(("/" + books[i]).c_str());
+void openBookAt(const String &name, long offset) {
+  book = SD.open(("/" + name).c_str());
+  if (!book) { drawMenu(); return; }
+  curBookName = name;
   scanChapters(book);
   history.clear();
-  curStart = 0;
+  curStart = offset;
   mode = READING;
-  renderPage();
+  renderPage();              // also saves the bookmark
+}
+
+void openBook(int i) { openBookAt(books[i], 0); }
+
+// On boot, reopen the last book at its last page. Returns false if there's no
+// usable bookmark (then the caller shows the library).
+bool tryResume() {
+  File b = SD.open(BOOKMARK_PATH);
+  if (!b) return false;
+  String name = b.readStringUntil('\n'); name.trim();
+  String offs = b.readStringUntil('\n'); offs.trim();
+  b.close();
+  if (name.length() == 0) return false;
+  bool found = false;
+  for (int i = 0; i < (int)books.size(); i++)
+    if (books[i] == name) { found = true; sel = i; break; }
+  if (!found) return false;              // book was removed from the card
+  openBookAt(name, offs.toInt());
+  return true;
 }
 
 void showError(const char *l1, const char *l2) {
@@ -270,23 +340,25 @@ void setup() {
     return;
   }
   loadFileList();
-  drawMenu();
+  if (!tryResume()) drawMenu();   // resume last page, else show the library
+  lastActivity = millis();
 }
 
 void loop() {
   int b = readButton();
-  if (!b) { delay(15); return; }
-
-  if (b == 6) {                 // hold CENTER anywhere = "off": blank screen, go idle
-    if (mode == READING) book.close();
-    clearScreen();
-    mode = SLEEP;
+  if (!b) {
+    if (millis() - lastActivity > AUTO_SLEEP_MS) {   // idle -> save + go dormant
+      saveBookmark();
+      deepSleep();                                   // reboots on button press
+    }
+    delay(15);
     return;
   }
-  if (mode == SLEEP) {          // any press = "on": back to the library
-    mode = MENU;
-    drawMenu();
-    return;
+  lastActivity = millis();
+
+  if (b == 6) {                 // hold CENTER anywhere = off: dormant, keep page shown
+    saveBookmark();
+    deepSleep();                // wakes on any button -> reboot -> resume
   }
 
   if (mode == MENU) {

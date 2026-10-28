@@ -95,8 +95,12 @@ with `EPD_SPI = &SPI1` and `SRAM_CS = -1` (board pins `PIN_EPD_*`).
 - Library menu: UP/DOWN move the cursor, CENTER opens a book.
 - Reading: RIGHT/LEFT turn pages, UP/DOWN jump to the previous/next chapter,
   CENTER returns to the library.
-- Hold CENTER for about a second to blank the screen (idle). Any press wakes it
-  back to the library.
+- Hold CENTER for about a second to turn it off. The screen blanks to white
+  (low-power idle). Any button wakes it and it redraws your current page.
+- Your place is saved automatically. After 5 minutes idle it also sleeps on its
+  own, and a reset or dead-then-charged battery still resumes the last page
+  instead of dropping to the library. Waking from sleep is a "press to wake,
+  press again to turn the page" — the wake press is consumed by waking.
 - Books are `.txt` files in the root of the SD card. Chapter jump works on books
   whose chapters start with `CHAPTER`, `PROLOGUE`, `EPILOGUE`, or `LETTER `.
   Books without those headings just won't jump, which is harmless.
@@ -122,6 +126,29 @@ for p in sys.argv[1:]:
 For HTML or EPUB, convert to text first (Calibre, or `pandoc book.epub -o book.txt`),
 then run the cleanup above. Text that still has non-ASCII characters shows up as
 garbage in the serif font, since that font only covers plain ASCII.
+
+## Power and resume
+The RP2040 never slept in the first version — it busy-polled the buttons at full
+clock forever, drawing ~20 mA, so a 500 mAh LiPo lasted roughly a day even with
+the screen "blank." That also caused an overnight failure mode: by morning the
+pack was low enough that the high-current ~15 s panel refresh on a page turn
+sagged the voltage and browned out the chip, which reset it back to the menu and
+lost your place (looked like "longer flicker, goes black, have to wake it").
+
+Now, after 5 minutes idle or on hold-CENTER, it drops the system clock from
+125 MHz to 48 MHz and waits for a button — cutting idle current several-fold, so
+the battery lasts longer. Before throttling it also blanks the panel to white:
+a dense page of text left on a tri-color panel for hours ghosts and makes the
+next refresh longer and darker, so resting on clean white avoids that and the
+wake redraws your page fresh. It also writes the current book + page
+offset to `/.bookmark` on the card after every page, so a sleep, reset, or
+brownout resumes exactly where you were. Waking is a clean reboot, so you get one
+~15 s refresh on wake and land on your page.
+
+This uses clock throttling rather than true dormant sleep, because this
+arduino-pico core version doesn't ship `pico/sleep.h` (it lives in pico-extras).
+Dormant mode would get idle draw down to ~0.2 mA (months of standby) if you set
+that up; the throttle is the no-dependency version and already fixes the drain.
 
 ## About the slow refresh
 Tri-color (red/black/white) eInk does a full refresh that flashes and takes about
